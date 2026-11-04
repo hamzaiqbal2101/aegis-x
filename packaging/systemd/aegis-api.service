@@ -1,0 +1,42 @@
+# AEGIS X Management API — systemd unit (Linux).
+#
+# Install: copy to /etc/systemd/system/aegis-api.service, then
+#   systemctl daemon-reload && systemctl enable --now aegis-api
+#
+# SECURITY NOTES (read before enabling):
+# * The API binds 127.0.0.1 only (see ExecStart). Do NOT change it to
+#   0.0.0.0 without TLS + stronger auth in front of it; the token
+#   auth is a single shared secret, not per-user RBAC.
+# * CAP_NET_ADMIN is granted so the API can apply policies via the
+#   aegis-linux CLI (nftables needs it). Without it, policy CRUD,
+#   validate, and audit still work, but host apply fails closed.
+# * The API NEVER applies anything on startup: enforcement is always
+#   an explicit operator action (POST /apply). A reboot does not
+#   reinstall rules; re-apply deliberately after verifying the policy.
+# * Set AEGIS_API_TOKEN in /etc/aegis-x/api.env (root-only, 0600).
+#   The unit refuses nothing if the token is missing — the API then
+#   generates an ephemeral token at startup and prints it to the
+#   journal, which is unusable for a service. Set it explicitly.
+[Unit]
+Description=AEGIS X Management API
+After=network.target
+Documentation=https://github.com/hamzaiqbal2101/aegis-x
+
+[Service]
+Type=simple
+User=aegis
+Group=aegis
+WorkingDirectory=/opt/aegis-x/api
+EnvironmentFile=-/etc/aegis-x/api.env
+ExecStart=/opt/aegis-x/api/.venv/bin/uvicorn app:app --host 127.0.0.1 --port 8000
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+StateDirectory=aegis-x
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

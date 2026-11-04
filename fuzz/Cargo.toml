@@ -1,0 +1,24 @@
+[package]
+name = "aegis-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Detached workspace: this crate is intentionally NOT a member of the
+# parent workspace (~/workspace/aegis-x/Cargo.toml is untouched), per
+# cargo-fuzz conventions. It has its own Cargo.lock.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+aegis-core = { path = "../crates/aegis-core" }
+
+[[bin]]
+name = "policy_parser"
+path = "fuzz_targets/policy_parser.rs"
+test = false
+doc = false

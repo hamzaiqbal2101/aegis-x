@@ -1,0 +1,13 @@
+[package]
+name = "aegis-linux"
+version = "0.1.0"
+edition = "2021"
+description = "AEGIS X Linux enforcement adapter: nftables renderer and applier"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "aegis-linux"
+path = "src/main.rs"
+
+[dependencies]
+aegis-core = { path = "../aegis-core" }

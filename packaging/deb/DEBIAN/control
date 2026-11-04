@@ -1,0 +1,13 @@
+Package: aegis-x
+Version: 0.1.0
+Section: net
+Priority: optional
+Architecture: amd64
+Maintainer: AEGIS X operator (fill in before release)
+Description: AEGIS X Next-Generation Firewall (Milestones M1-M8, unverified parts noted)
+ Cross-platform policy engine (Rust), Linux nftables adapter, Windows
+ WFP adapter (uncompiled/unverified — see docs/VALIDATION.md §6),
+ management API (FastAPI), and dashboard (React). This package is
+ NOT release-ready: Windows enforcement, Suricata integration, and
+ live threat feeds are still roadmap. See docs/ADMIN_GUIDE.md.
+Depends: python3, nftables, iproute2

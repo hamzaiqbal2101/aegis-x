@@ -1,0 +1,154 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  AEGIS X — WiX v4/v5 installer source (NOT a built MSI).
+
+  HONEST STATUS — READ FIRST:
+  * This file is installer SOURCE ONLY. It was validated here as
+    well-formed XML (python xml parse). WiX v7 compile errors found
+    Nov 3, 2026 on the operator's PC were fixed the same evening
+    (CustomAction File -> FileRef; Custom condition moved from
+    inner text to the Condition attribute, WIX0400), the MSI built
+    and its install/uninstall cycle PASSED there, and a default
+    policy (allow-all, empty rules, NeverOverwrite) was added the
+    same evening to close the bare-install gap — but the MSI
+    rebuild with that policy, and its retest, are still pending
+    on the operator's PC, and that build is the real schema check
+    for the new component.
+  * The resulting MSI is UNSIGNED until the operator signs it with
+    their own code-signing certificate (see build-msi.ps1). Never
+    ship the unsigned MSI as a release, and never invent a
+    certificate.
+  * The service binary (aegis-service.exe) has since been VERIFIED
+    under the SCM on a real Windows host (Nov 3, 2026:
+    `SERVICE VERIFICATION: PASS`). The MSI must still not be
+    treated as a verified installer until the MSI install/uninstall
+    cycle is itself tested there.
+  * Component GUIDs below were generated fresh with uuidgen for this
+    MSI. They deliberately do NOT reuse the WFP provider/sublayer
+    GUIDs (see crates/aegis-windows/src/engine.rs) — MSI component
+    identity and WFP object identity are unrelated namespaces.
+
+  Build variables (passed by build-msi.ps1, absolute paths):
+    BinaryDir — directory holding release aegis-win.exe +
+               aegis-service.exe (cargo build, release mode).
+    RepoRoot  — repository root, for the bundled docs.
+
+  Design notes:
+  * No custom UI: the MSI uses the WiX default dialogs only. No
+    UIRef, no custom dialogs, no branding changes.
+  * Service: name "AEGIS X" (must match the name the binary
+    registers with RegisterServiceCtrlHandlerExW in
+    aegis-service.rs). Start type auto, LocalSystem account.
+    NOTE from docs/WINDOWS_PACKAGING.md: LocalSystem is powerful;
+    a dedicated service account is follow-up work, not done here.
+  * ServiceControl starts the service on install and stops + removes
+    it on uninstall. The service's own stop handler uninstalls WFP
+    filters; the UninstallWfpFilters custom action below is belt
+    and braces for the case where the service never ran (e.g. it
+    failed to start) — it runs after StopServices while the binary
+    still exists, and its failure is ignored so uninstall never
+    fails on cleanup.
+  * MajorUpgrade: major upgrades replace the previous version. No
+    config migration exists yet (the service reads a policy file,
+    not MSI-managed config), so there is nothing to migrate — but
+    that gap is stated, not papered over.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="AEGIS X"
+          Manufacturer="AEGIS X"
+          Version="0.1.0"
+          UpgradeCode="ba124f2a-904b-4c44-9b2f-5b7af52e6f26"
+          Scope="perMachine">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of AEGIS X is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- Default policy: installed to %ProgramData%\AEGIS X\policy.json,
+         the path the service reads by default. Default action allow
+         with no rules: a bare install starts the service healthy and
+         blocks nothing, instead of failing fast on a missing file
+         (the gap found in the Nov 3, 2026 MSI cycle test).
+         NeverOverwrite: an upgrade/reinstall never clobbers a policy
+         the operator customized. Uninstall still removes the file
+         (it is install-owned config for v0.1) — a future version may
+         mark this component Permanent instead. -->
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="AegisProgramDataDir" Name="AEGIS X">
+        <Component Id="DefaultPolicy" Guid="0e34f0cf-92af-4aa4-91e7-2ecfccc89ca4" NeverOverwrite="yes">
+          <File Id="DefaultPolicyFile"
+                Source="$(var.RepoRoot)\packaging\windows\default-policy.json"
+                Name="policy.json"
+                KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="InstallDir" Name="AEGIS X">
+        <Component Id="AegisWinExe" Guid="47db0d2a-714b-483d-bbda-e3838e31996c">
+          <File Id="AegisWinExeFile"
+                Source="$(var.BinaryDir)\aegis-win.exe"
+                KeyPath="yes" />
+        </Component>
+        <Component Id="AegisServiceExe" Guid="0c17d1f6-cfa6-4825-a83f-98ee6375dd97">
+          <File Id="AegisServiceExeFile"
+                Source="$(var.BinaryDir)\aegis-service.exe"
+                KeyPath="yes" />
+          <ServiceInstall Id="AegisServiceInstall"
+                          Name="AEGIS X"
+                          DisplayName="AEGIS X"
+                          Description="AEGIS X next-generation firewall enforcement service (Windows Filtering Platform)."
+                          Start="auto"
+                          Type="ownProcess"
+                          Account="LocalSystem"
+                          ErrorControl="normal" />
+          <ServiceControl Id="AegisServiceControl"
+                          Name="AEGIS X"
+                          Start="install"
+                          Stop="both"
+                          Remove="uninstall"
+                          Wait="yes" />
+        </Component>
+        <Directory Id="DocsDir" Name="Docs">
+          <Component Id="AdminGuideDoc" Guid="db12feb3-a674-4025-a64a-91f9800c75d3">
+            <File Id="AdminGuideDocFile"
+                  Source="$(var.RepoRoot)\docs\ADMIN_GUIDE.md"
+                  KeyPath="yes" />
+          </Component>
+          <Component Id="WindowsReadmeDoc" Guid="4f9d575e-b0d4-4a07-b22f-3c3515792906">
+            <File Id="WindowsReadmeDocFile"
+                  Source="$(var.RepoRoot)\crates\aegis-windows\README.md"
+                  KeyPath="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <ComponentGroup Id="ProductComponents">
+      <ComponentRef Id="AegisWinExe" />
+      <ComponentRef Id="AegisServiceExe" />
+      <ComponentRef Id="AdminGuideDoc" />
+      <ComponentRef Id="WindowsReadmeDoc" />
+      <ComponentRef Id="DefaultPolicy" />
+    </ComponentGroup>
+
+    <Feature Id="ProductFeature" Title="AEGIS X" Level="1">
+      <ComponentGroupRef Id="ProductComponents" />
+    </Feature>
+
+    <!-- Belt and braces: remove WFP filters on MSI uninstall even if
+         the service never ran. Deferred (runs as LocalSystem),
+         scheduled after StopServices while aegis-win.exe still
+         exists, failure ignored so uninstall cannot fail on cleanup.
+         The service's own stop handler already uninstalls filters
+         when the service ran normally. -->
+    <CustomAction Id="UninstallWfpFilters"
+                  FileRef="AegisWinExeFile"
+                  ExeCommand="uninstall"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+    <InstallExecuteSequence>
+      <Custom Action="UninstallWfpFilters" After="StopServices" Condition="REMOVE=&quot;ALL&quot;" />
+    </InstallExecuteSequence>
+  </Package>
+</Wix>
