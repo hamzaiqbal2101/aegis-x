@@ -1,0 +1,81 @@
+# AEGIS X — Windows release build + SignPath signing (TEMPLATE, not yet live)
+#
+# HOW TO ADD (GitHub App cannot write workflow files, so this goes in by hand):
+#   1. Repo page -> Actions tab -> "New workflow" -> "set up a workflow yourself"
+#   2. File name must be exactly: .github/workflows/sign-windows.yml
+#   3. Paste this whole file, then Commit changes.
+#
+# WHAT STILL NEEDS FILLING IN (after SignPath approves the application):
+#   - SIGNPATH_API_TOKEN: a repository secret, created at
+#     Settings -> Secrets and variables -> Actions -> New repository secret.
+#     The value comes from the SignPath portal after approval. Never paste it
+#     into this file or into chat.
+#   - vars / secrets below marked TODO-SIGNPATH: organization-id, project-slug
+#     and signing-policy-slug all come from the SignPath portal after approval.
+#   Until those exist, this workflow will fail at the signing step by design —
+#   the MSI build steps above it should still succeed, which is a useful check.
+#
+# WHAT IT DOES:
+#   On a published GitHub Release (tag like v0.1.0), it builds the MSI from the
+#   exact tagged commit on a GitHub-hosted Windows runner, then sends the MSI
+#   to SignPath for signing and uploads the signed MSI back to the release job.
+#   No private key is ever stored in the repo; signing happens on SignPath's side.
+
+name: Sign Windows MSI
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-sign:
+    runs-on: windows-latest
+    steps:
+      - name: Check out tagged release
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Set up .NET SDK 8 (for the WiX tool)
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Install WiX v7
+        run: dotnet tool install --global wix
+
+      - name: Accept WiX EULA
+        run: wix eula accept wix7
+
+      - name: Build the MSI
+        shell: pwsh
+        run: |
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+          .\packaging\windows\build-msi.ps1
+
+      - name: Upload unsigned MSI as job artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aegis-x-msi-unsigned
+          path: packaging/windows/aegis-x.msi
+
+      # TODO-SIGNPATH: fill in the three values below from the SignPath portal
+      # after the application is approved. Do not run a signed release before then.
+      - name: Sign the MSI with SignPath
+        uses: signpath/github-action@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: TODO-SIGNPATH-ORG-ID
+          project-slug: TODO-SIGNPATH-PROJECT-SLUG
+          signing-policy-slug: TODO-SIGNPATH-POLICY-SLUG
+          github-artifact-id: aegis-x-msi-unsigned
+          output-artifact-directory: signed-msi
+
+      - name: Upload signed MSI as job artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aegis-x-msi-signed
+          path: signed-msi/aegis-x.msi
