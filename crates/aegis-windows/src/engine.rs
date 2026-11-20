@@ -35,8 +35,13 @@
 //!   Firewall rules stop being decisive. This is stated openly, not
 //!   hidden: a dedicated firewall product must win arbitration, or it
 //!   protects nothing.
-//! * Filter keys are deterministic (SHA-256 of rule id + layer), so a
-//!   reinstall addresses the same filters.
+//! * Filter keys are deterministic (SHA-256 of rule id + layer +
+//!   expansion index), so a reinstall addresses the same filters.
+//!   The expansion index is load-bearing: one rule expands into
+//!   several concrete filters, and WFP requires a unique key per
+//!   filter (review Nov 14, 2026: the old key omitted the index and
+//!   any rule with a port list or multiple addresses broke install
+//!   with FWP_E_ALREADY_EXISTS).
 //! * Direction: WFP distinguishes local vs remote addresses, not
 //!   source vs destination. For connect layers (outbound) local = the
 //!   rule's source, remote = its destination; for recv-accept layers
@@ -47,13 +52,38 @@
 //!   same weight and action, which is always correct (filters from one
 //!   rule share a verdict, so order among them cannot change the
 //!   outcome). Port ranges use FWP_RANGE0, not per-port expansion.
+//!   Expansion lives in `translate.rs` (pure, unit-tested) — the
+//!   engine only installs what it returns.
 //! * Fail-closed limits in M4 (each returns an error, never a silently
-//!   weakened rule):
+//!   weakened rule; the gate lives in `translate.rs` so it is
+//!   unit-testable on Linux):
 //!   - interface-scoped rules (Windows interface naming differs from
 //!     Linux names; mapping is M4 follow-up),
 //!   - rules matching only `invalid` state (they can never fire),
+//!   - rate-limited rules (WFP has no per-rule rate limit; installing
+//!     one unthrottled would silently drop the throttle),
+//!   - priority >= 100_000 (weight saturates to 0, colliding with the
+//!     default-deny filter),
 //!   - app paths that fail app-id resolution (a rule must never be
 //!     installed without its app scope).
+//! * Phase-1 fail-open window (residual, documented not fixed):
+//!   install phase 1 deletes the old filters (each delete commits
+//!   immediately, outside any transaction) BEFORE the sublayer
+//!   delete transaction. If that sublayer delete fails, the old
+//!   filters are already gone and the sublayer remains with no
+//!   filters — WFP's default when no filter matches is PERMIT, so
+//!   the machine is unfiltered by AEGIS until the install is
+//!   retried. The two-step shape is forced (delete+add in one
+//!   transaction fails FWP_E_ALREADY_EXISTS; filter-delete +
+//!   sublayer-delete in one transaction would hit FWP_E_IN_USE for
+//!   the same staged-visibility reason), so mitigate by retrying a
+//!   failed install immediately and alerting on repeated failure.
+//!   (Review Nov 14, 2026.)
+//! * Default deny comes ONLY from the weight-0 block-all filters:
+//!   WFP has no sublayer-level default, and when no filter matches
+//!   it permits. (An earlier comment claimed the sublayer was
+//!   "configured block-by-default"; no such setting exists and no
+//!   code ever set it. Review Nov 14, 2026.)
 //! * States otherwise: ALE authorizes at connection establishment and
 //!   the connection's later packets follow that verdict, so rule states
 //!   are establishment-time semantics on Windows (documented, not
@@ -98,14 +128,16 @@ mod imp {
         fmt_guid, InstallReport, OLD_PROVIDER_KEY_U128,
         OLD_SUBLAYER_KEY_U128, PROVIDER_KEY_U128, SUBLAYER_KEY_U128,
     };
-    use crate::translate::{translate, WfpAction, WfpFilter, WfpLayer};
-    use aegis_core::policy::{Cidr, ConnState, PortSpec, Protocol};
+    use crate::translate::{
+        expand, filter_key_bytes, gate_policy, translate, Expanded, PortChoice, WfpAction,
+        WfpFilter, WfpLayer,
+    };
+    use aegis_core::policy::{Cidr, Protocol};
     use aegis_core::Policy;
     use std::collections::HashMap;
     use std::ffi::OsStr;
     use std::net::IpAddr;
     use std::os::windows::ffi::OsStrExt;
-    use sha2::{Digest, Sha256};
     use windows::core::{GUID, PCWSTR, PWSTR};
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::NetworkManagement::WindowsFilteringPlatform::*;
@@ -227,29 +259,12 @@ mod imp {
         }
     }
 
-    fn is_connect(layer: WfpLayer) -> bool {
-        matches!(
+    fn filter_key(rule_id: &str, layer: WfpLayer, expansion_index: usize) -> GUID {
+        GUID::from_u128(u128::from_be_bytes(filter_key_bytes(
+            rule_id,
             layer,
-            WfpLayer::AleAuthConnectV4 | WfpLayer::AleAuthConnectV6
-        )
-    }
-
-    fn is_v6(layer: WfpLayer) -> bool {
-        matches!(
-            layer,
-            WfpLayer::AleAuthConnectV6 | WfpLayer::AleAuthRecvAcceptV6
-        )
-    }
-
-    fn filter_key(rule_id: &str, layer: WfpLayer) -> GUID {
-        let mut h = Sha256::new();
-        h.update(b"aegis-x-filter-v1");
-        h.update(rule_id.as_bytes());
-        h.update([layer as u8]);
-        let digest = h.finalize();
-        GUID::from_u128(u128::from_be_bytes(
-            digest[0..16].try_into().expect("sha256 is 32 bytes"),
-        ))
+            expansion_index,
+        )))
     }
 
     fn ensure_provider(engine: &Engine) -> Result<(), String> {
@@ -417,111 +432,12 @@ mod imp {
         if prefix == 0 {
             0
         } else {
-            u32::MAX << (32 - prefix)
+            // saturating_sub: a prefix > 32 (only reachable by
+            // hand-constructing a Cidr, since Cidr::parse validates)
+            // used to underflow and panic in debug builds.
+            // (Review Nov 14, 2026.)
+            u32::MAX << (32u8.saturating_sub(prefix))
         }
-    }
-
-    /// One port match choice for a single WFP filter.
-    #[derive(Debug, Clone, Copy)]
-    enum PortChoice {
-        Any,
-        Single(u16),
-        Range(u16, u16),
-    }
-
-    /// One concrete combination of match values for a single WFP filter.
-    struct Expanded {
-        local_addr: Option<Cidr>,
-        remote_addr: Option<Cidr>,
-        local_port: PortChoice,
-        remote_port: PortChoice,
-    }
-
-    fn port_options(spec: &Option<PortSpec>) -> Vec<PortChoice> {
-        match spec {
-            None => vec![PortChoice::Any],
-            Some(PortSpec::Single(p)) => vec![PortChoice::Single(*p)],
-            Some(PortSpec::List(ps)) => {
-                ps.iter().map(|p| PortChoice::Single(*p)).collect()
-            }
-            Some(PortSpec::Range { range: (low, high) }) => {
-                vec![PortChoice::Range(*low, *high)]
-            }
-        }
-    }
-
-    /// Expand one translated filter into concrete filters. Returns an
-    /// empty vec when the filter's family has no addresses on this layer
-    /// (the filter must be skipped, never broadened to "any").
-    fn expand(filter: &WfpFilter) -> Vec<Expanded> {
-        let v6 = is_v6(filter.layer);
-        let fam = |c: &Cidr| match (v6, c.network) {
-            (true, IpAddr::V6(_)) => true,
-            (false, IpAddr::V4(_)) => true,
-            _ => false,
-        };
-        if !filter.src_addrs.is_empty() && !filter.src_addrs.iter().any(fam) {
-            return vec![];
-        }
-        if !filter.dst_addrs.is_empty() && !filter.dst_addrs.iter().any(fam) {
-            return vec![];
-        }
-        let srcs: Vec<Option<Cidr>> = {
-            let kept: Vec<Cidr> = filter
-                .src_addrs
-                .iter()
-                .filter(|c| fam(c))
-                .cloned()
-                .collect();
-            if kept.is_empty() {
-                vec![None]
-            } else {
-                kept.into_iter().map(Some).collect()
-            }
-        };
-        let dsts: Vec<Option<Cidr>> = {
-            let kept: Vec<Cidr> = filter
-                .dst_addrs
-                .iter()
-                .filter(|c| fam(c))
-                .cloned()
-                .collect();
-            if kept.is_empty() {
-                vec![None]
-            } else {
-                kept.into_iter().map(Some).collect()
-            }
-        };
-        let sport_opts = port_options(&filter.src_port);
-        let dport_opts = port_options(&filter.dst_port);
-        let connect = is_connect(filter.layer);
-        let mut out = Vec::new();
-        for s in &srcs {
-            for d in &dsts {
-                for sp in &sport_opts {
-                    for dp in &dport_opts {
-                        // Local/remote mapping depends on direction.
-                        let (local_addr, remote_addr) = if connect {
-                            (s.clone(), d.clone())
-                        } else {
-                            (d.clone(), s.clone())
-                        };
-                        let (local_port, remote_port) = if connect {
-                            (*sp, *dp)
-                        } else {
-                            (*dp, *sp)
-                        };
-                        out.push(Expanded {
-                            local_addr,
-                            remote_addr,
-                            local_port,
-                            remote_port,
-                        });
-                    }
-                }
-            }
-        }
-        out
     }
 
     fn app_id_blob(
@@ -651,6 +567,7 @@ mod imp {
         engine: &Engine,
         filter: &WfpFilter,
         ex: &Expanded,
+        expansion_index: usize,
         app_blobs: &mut HashMap<String, *mut FWP_BYTE_BLOB>,
     ) -> Result<(), String> {
         let mut scratch = Scratch::default();
@@ -705,7 +622,7 @@ mod imp {
             WfpAction::Block => FWP_ACTION_BLOCK,
         };
         let wfp_filter = FWPM_FILTER0 {
-            filterKey: filter_key(&filter.id, filter.layer),
+            filterKey: filter_key(&filter.id, filter.layer, expansion_index),
             displayData: FWPM_DISPLAY_DATA0 {
                 name: name.as_pwstr(),
                 description: desc.as_pwstr(),
@@ -742,25 +659,10 @@ mod imp {
         Ok(())
     }
 
-    fn gate_policy(policy: &Policy) -> Result<(), String> {
-        for rule in &policy.rules {
-            if rule.in_interface.is_some() || rule.out_interface.is_some() {
-                return Err(format!(
-                    "rule {} uses interface scoping, unsupported on Windows in M4",
-                    rule.id
-                ));
-            }
-            if rule.states.len() == 1 && rule.states[0] == ConnState::Invalid {
-                return Err(format!(
-                    "rule {} matches only invalid state and can never fire",
-                    rule.id
-                ));
-            }
-        }
-        Ok(())
-    }
-
     pub fn install_policy(policy: &Policy) -> Result<InstallReport, String> {
+        // Gate lives in translate.rs (pure, unit-tested on Linux):
+        // interface scoping, invalid-only states, rate limits,
+        // priority cap.
         gate_policy(policy)?;
         let filters = translate(policy);
         // Phase 1: committed delete of any previous sublayer (and its
@@ -798,13 +700,24 @@ mod imp {
         let result = (|| -> Result<usize, String> {
             let mut count = 0;
             for filter in &filters {
-                for ex in expand(filter) {
-                    add_one_filter(&engine, filter, &ex, &mut app_blobs)?;
+                for (index, ex) in expand(filter).iter().enumerate() {
+                    add_one_filter(&engine, filter, ex, index, &mut app_blobs)?;
                     count += 1;
                 }
             }
             Ok(count)
         })();
+        // The app-id blobs are only needed during the FwpmFilterAdd0
+        // calls: free them BEFORE committing, so a commit failure
+        // cannot leak them (the old code freed them only after a
+        // successful commit, and the commit() `?` exit skipped the
+        // free entirely). (Review Nov 14, 2026.)
+        for (_, blob) in app_blobs.drain() {
+            unsafe {
+                let mut p = blob as *mut std::ffi::c_void;
+                FwpmFreeMemory0(&mut p);
+            }
+        }
         let count = match result {
             Ok(count) => {
                 txn.commit()?;
@@ -812,21 +725,9 @@ mod imp {
             }
             Err(e) => {
                 drop(txn); // aborts
-                for (_, blob) in app_blobs.drain() {
-                    unsafe {
-                        let mut p = blob as *mut std::ffi::c_void;
-                        FwpmFreeMemory0(&mut p);
-                    }
-                }
                 return Err(e);
             }
         };
-        for (_, blob) in app_blobs.drain() {
-            unsafe {
-                let mut p = blob as *mut std::ffi::c_void;
-                FwpmFreeMemory0(&mut p);
-            }
-        }
         Ok(InstallReport {
             filters_installed: count,
             provider_key: fmt_guid(PROVIDER_KEY_U128),
@@ -1137,11 +1038,22 @@ mod imp {
     }
 
     pub fn status() -> Result<String, String> {
-        let _engine = Engine::open()?;
+        let engine = Engine::open()?;
+        // Actually enumerate: the old version only opened the engine
+        // and reported "reachable" even with zero filters installed.
+        // (Review Nov 14, 2026.)
+        let ids = filters_in_sublayer(&engine, SUBLAYER_KEY_U128)?;
+        let note = if ids.is_empty() {
+            "WARNING: no AEGIS filters are installed — the machine is \
+             NOT filtered by AEGIS (install a policy first)."
+        } else {
+            "AEGIS filters are installed."
+        };
         Ok(format!(
-            "WFP engine reachable (Administrator access confirmed).\nAEGIS provider key: {}\nAEGIS sublayer key: {}\nNote: filter enumeration is M4 follow-up; use uninstall to remove all AEGIS filters.",
+            "WFP engine reachable (Administrator access confirmed).\nAEGIS provider key: {}\nAEGIS sublayer key: {}\nAEGIS filters installed: {}\n{note}",
             fmt_guid(PROVIDER_KEY_U128),
-            fmt_guid(SUBLAYER_KEY_U128)
+            fmt_guid(SUBLAYER_KEY_U128),
+            ids.len()
         ))
     }
 }

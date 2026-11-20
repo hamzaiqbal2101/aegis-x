@@ -30,6 +30,7 @@ import asyncio
 import hashlib
 import ipaddress
 import json
+import math
 import os
 import secrets
 import socket
@@ -56,6 +57,8 @@ APP_DIR = Path(__file__).resolve().parent
 MAX_BODY_BYTES = 1 * 1024 * 1024          # request bodies larger than this -> 413
 MAX_POLICY_DEPTH = 100                    # JSON nesting levels in a stored policy
 MAX_POLICY_RULES = 1000                   # rules in a stored policy
+MAX_POLICY_STRING = 65_536                # chars in any one string in a stored policy
+MAX_LIST_LIMIT = 1000                     # max `limit` on list endpoints
 MAX_FEED_INDICATORS = 10_000              # indicators in one feed body
 MAX_FEED_BODY_BYTES = 1 * 1024 * 1024     # bytes read from a feed response
 MAX_SQLITE_INT = 2**63 - 1                # ids outside 1..MAX_SQLITE_INT -> 404
@@ -147,7 +150,10 @@ def get_conn():
     path = db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     existed = path.exists()
-    conn = sqlite3.connect(str(path))
+    # timeout=30: the default 5 s busy timeout lets a concurrent
+    # writer (the background feed loop + an admin request) 500 with
+    # "database is locked" under contention. (Review Nov 14, 2026.)
+    conn = sqlite3.connect(str(path), timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute(
         """CREATE TABLE IF NOT EXISTS policies (
@@ -246,6 +252,45 @@ def _json_depth(value) -> int:
     return max_depth
 
 
+def _json_magnitude_ok(value) -> str | None:
+    """Iterative scalar-magnitude check over a parsed JSON value.
+
+    Returns an error string or None. Bounds (review Nov 14, 2026):
+    * strings longer than MAX_POLICY_STRING (64 KiB) — a stored
+      policy has no length cap today, so one huge name/description
+      bloats storage and every later read;
+    * ints outside the signed 64-bit range — Python happily parses
+      a 5000-digit int, but json.dumps then raises ValueError
+      ("Exceeds the limit for integer string conversion") and 500s
+      the create/read, and SQLite cannot bind it either;
+    * non-finite floats (NaN/Infinity parse from JSON) — json.dumps
+      emits them as bare NaN/Infinity, which is not valid JSON, so
+      a stored policy would corrupt its own serialization.
+    Iterative like _json_depth: recursion would hit RecursionError
+    on the input this is meant to reject. (bool is checked before
+    int: in Python bool is a subclass of int.)
+    """
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, bool):
+            continue
+        if isinstance(item, str):
+            if len(item) > MAX_POLICY_STRING:
+                return f"a string in the policy exceeds {MAX_POLICY_STRING} characters"
+        elif isinstance(item, int):
+            if not (-MAX_SQLITE_INT - 1 <= item <= MAX_SQLITE_INT):
+                return "an integer in the policy exceeds the 64-bit range"
+        elif isinstance(item, float):
+            if not math.isfinite(item):
+                return "a number in the policy is not finite (NaN/Infinity)"
+        elif isinstance(item, dict):
+            stack.extend(item.values())
+        elif isinstance(item, list):
+            stack.extend(item)
+    return None
+
+
 def validate_policy_shape(policy) -> str | None:
     """Shallow write-time validation only. Returns an error string or None.
 
@@ -267,6 +312,9 @@ def validate_policy_shape(policy) -> str | None:
         return f"policy.rules exceeds {MAX_POLICY_RULES} entries"
     if _json_depth(policy) > MAX_POLICY_DEPTH:
         return f"policy JSON nesting exceeds {MAX_POLICY_DEPTH} levels"
+    magnitude_err = _json_magnitude_ok(policy)
+    if magnitude_err is not None:
+        return magnitude_err
     return None
 
 
@@ -456,7 +504,7 @@ def status():
 
 
 @app.get("/policies", dependencies=[Depends(require_auth)])
-def list_policies(limit: int = Query(default=1000, ge=1, le=10000),
+def list_policies(limit: int = Query(default=1000, ge=1, le=MAX_LIST_LIMIT),
                   offset: int = Query(default=0, ge=0)):
     conn = get_conn()
     rows = conn.execute(
@@ -840,6 +888,14 @@ def refresh_feed(actor: str = "system") -> dict:
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         return _feed_fail("invalid_feed",
                           f"invalid feed: not valid JSON ({exc})", actor)
+    except RecursionError:
+        # A feed body of deeply nested "[" (a few hundred KB, under
+        # the 1 MiB cap) used to raise RecursionError here and 500
+        # the endpoint with no outcome recorded, breaking this
+        # function's never-raises contract. It is just an invalid
+        # feed; the stored set is preserved. (Review Nov 14, 2026.)
+        return _feed_fail("invalid_feed",
+                          "invalid feed: JSON nesting too deep", actor)
     indicators, err = validate_feed_shape(data)
     if err is not None:
         return _feed_fail("invalid_feed", f"invalid feed: {err}", actor)
@@ -991,7 +1047,7 @@ def get_telemetry_counters():
 
 
 @app.get("/audit", dependencies=[Depends(require_auth)])
-def list_audit(limit: int = Query(default=1000, ge=1, le=10000),
+def list_audit(limit: int = Query(default=1000, ge=1, le=MAX_LIST_LIMIT),
                offset: int = Query(default=0, ge=0)):
     # Deliberately no PUT/DELETE/PATCH route for /audit exists anywhere
     # in this app: audit rows are append-only via the API.

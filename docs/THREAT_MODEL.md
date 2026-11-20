@@ -14,7 +14,7 @@
 | Remote network attacker | Port scans, exploit attempts, spoofed packets, floods, DNS abuse, evasion (fragmentation, IPv6, TTL games) | Yes — primary |
 | Malicious/compromised local application | Tries to phone home, pivot laterally, disable the firewall, change policy | Yes — app control + tamper detection |
 | Malicious local user (non-admin) | Tries to alter policy, stop the service, read the audit log | Yes — admin-only management, RBAC |
-| Admin account compromise | Full policy control | Partially — audit log + backups + signed updates limit silent persistence; cannot fully mitigate a compromised admin |
+| Admin account compromise | Full policy control | Partially — audit log + backups limit silent persistence (no signed-update mechanism exists yet); cannot fully mitigate a compromised admin |
 | Nation-state / kernel-level attacker | Kernel exploits, supply-chain compromise | No — out of scope; documented residual risk |
 
 ## 3. Threat → mitigation mapping
@@ -24,13 +24,13 @@
 | Unsolicited inbound connections | Default deny; stateful inspection; only established/related traffic returns | Misconfigured allow rule — mitigated by conflict detection + review UI |
 | Port scans / brute force | IDS signatures (M3+), rate limits, temporary blocks | Slow scans under thresholds; accepted, logged |
 | SYN flood / UDP flood | Rate limits, SYN controls, adaptive thresholds (M3) | Volumetric floods above link capacity cannot be fixed on-host |
-| Malware phoning home | App control (Windows full; Linux limited), DNS blocklists, behavioral anomalies (M4+) | Linux app identity is weaker (see matrix); process can rename itself — mitigated by hash-based identity on Windows, partial on Linux |
+| Malware phoning home | App control (Windows full; Linux limited), DNS blocklists, behavioral anomalies (M4+) | Linux app identity is weaker (see matrix); process can rename itself — WFP app identity is path-derived (the app-id hashes the file path, not its contents), so a binary replaced at the same path keeps its allow |
 | DNS tunneling / malicious domains | DNS security engine (M5): blocklists, query monitoring, tunneling heuristics | Encrypted DNS (DoH) to an allowed resolver bypasses DNS inspection — documented; endpoint controls are the backstop |
 | Evasion: fragmentation, IPv6, overlapping segments | Anti-evasion engine: fragment policy, IPv6 parity checks, invalid-packet drop (M1 base policy) | OS reassembly differences are a known hard problem; defense in depth, not a guarantee |
-| Rule shadowing / misconfiguration | Conflict detection before apply; rule testing; staged rollout + rollback timer | Human error in *intended* policy cannot be detected automatically |
-| Tampering with policy/service | Policy hashing, signed updates, tamper alerts, audit log, admin-only access | A root/admin attacker can disable any host control — documented |
-| Lockout by bad policy | Rollback timer, last-known-good policy, emergency recovery mode | Physical/console access may still be required in worst cases |
-| Supply-chain (malicious update) | Signed packages, signature verification before install | Signing-key compromise — key rotation procedure required (ops doc, later) |
+| Rule shadowing / misconfiguration | Conflict detection before apply; rule testing; manual rollback | Human error in *intended* policy cannot be detected automatically; no staged rollout or automatic rollback timer yet |
+| Tampering with policy/service | Policy hashing, audit log, admin-only access | Signed updates and tamper alerts are not implemented; a root/admin attacker can disable any host control — documented |
+| Lockout by bad policy | Last-known-good policy + manual rollback | Automatic rollback timer and emergency recovery are not implemented; physical/console access may still be required in worst cases |
+| Supply-chain (malicious update) | Release MSI signing via SignPath (in progress); no in-product update signature verification yet | Signing-key compromise — key rotation procedure required (ops doc, later) |
 
 ## 4. Explicit non-goals (do not claim these)
 

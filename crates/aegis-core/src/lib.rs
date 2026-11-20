@@ -26,7 +26,7 @@ pub use conflict::{detect_conflicts, Conflict, ConflictKind};
 pub use dns::{analyze_name, entry_matches, normalize, DnsAnalysis, DnsConfig, DnsPolicy, DnsVerdict};
 pub use ids::{detect_all, detect_brute_force, detect_known_bad, detect_port_scans};
 pub use ids::{ConnEvent, Finding, FindingKind, IdsConfig};
-pub use integrity::policy_hash;
+pub use integrity::{policy_hash, sha256_hex};
 pub use matcher::{evaluate, rule_matches, EvalPacket, Verdict};
 pub use policy::{Action, Cidr, ConnState, Policy, PortSpec, Protocol, RateLimit, RateUnit, Rule, Zone};
 pub use ratelimit::{RateLimiter, TokenBucket};

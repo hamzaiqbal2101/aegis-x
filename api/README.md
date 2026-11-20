@@ -53,7 +53,7 @@ is set) may use GET endpoints only — a mutating request with it → `403`.
 | Method & path | Body | Notes |
 |---|---|---|
 | `GET /status` | — | No auth. API version, engine availability, DB ok. (No install path is returned.) |
-| `GET /policies` | — | List stored policies (with hashes). `?limit=` (default 1000, max 10000) and `?offset=` (default 0) bound the result. |
+| `GET /policies` | — | List stored policies (with hashes). `?limit=` (default 1000, max 1000) and `?offset=` (default 0) bound the result. |
 | `POST /policies` | `{name, policy}` | `policy` must be an object with `version`, `name`, `default_action`, `rules` or → `400`. |
 | `GET /policies/{id}` | — | |
 | `PUT /policies/{id}` | `{name?, policy}` | Same write validation as POST. |

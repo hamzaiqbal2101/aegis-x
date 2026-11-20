@@ -144,9 +144,18 @@ telemetry: nft counters + conntrack events → API → dashboard
 ```
 
 Windows equivalent: WFP ALE_AUTH_CONNECT / ALE_AUTH_RECV_ACCEPT layers,
-sublayers ordered by priority weight, default block.
+sublayers ordered by priority weight. Default deny comes ONLY from the
+weight-0 block-all filters: WFP has no sublayer-level default, and when
+no filter matches it permits. (Review Nov 14, 2026: an earlier version
+of this line said "default block", which overstated the mechanism.)
 
-## 6. Security modes
+## 6. Security modes — ROADMAP, not implemented
+
+> Status (review Nov 14, 2026): only the `standard` mode exists in
+> code, and nothing branches on it — `mode` is a free string rendered
+> in the nft header comment. A policy that says `monitor` would still
+> enforce its rules. The loader rejects any mode other than
+> `standard` until mode profiles are actually implemented.
 
 | Mode | Default | IDS | Threat intel | App control |
 |------|---------|-----|--------------|-------------|
@@ -160,19 +169,29 @@ individually configurable afterwards. Applying a mode that adds blocking
 rules requires explicit confirmation in the UI/API, with a warning that
 connectivity may be interrupted, and an automatic rollback timer
 (default 60 s: if the operator does not confirm, the previous policy is
-restored). This is the anti-lockout mechanism.
+restored). This is the anti-lockout mechanism. **The rollback timer is
+not implemented**: rollback today is a manual CLI/API action
+(`aegis-linux rollback`), and the last known-good policy is retained
+for it. Do not claim the timer exists until it is built and tested.
 
 ## 7. Integrity, updates, recovery
 
-* Policies are stored with a SHA-256 hash; the adapter refuses to apply a
-  policy whose content differs from its recorded hash unless the operator
-  re-signs (re-approves) it.
+* Policies are stored with a SHA-256 hash (tamper evidence: the hash
+  lets an operator detect that a stored policy changed). There is NO
+  hash re-approval gate: the adapter does not refuse to apply a policy
+  whose content differs from its recorded hash. (Review Nov 14, 2026:
+  an earlier version of this bullet claimed such a gate exists.)
 * The last known-good policy is always retained; `rollback` restores it.
+  Rollback verifies the stored script's SHA-256 before applying it
+  (added Nov 14, 2026).
 * The management API requires authentication; admin actions are audit-logged
   (who, what, when, previous value).
-* Updates to AEGIS X itself are delivered as signed packages; the updater
-  verifies the signature before installing and keeps the previous version
-  for rollback.
+* Updates to AEGIS X itself: there is currently NO updater and NO
+  signature verification of updates. Release MSIs are signed via
+  SignPath (in progress — see CODE_SIGNING.md), which authenticates
+  the release artifact, but nothing in the product verifies an update
+  signature before installing. (Review Nov 14, 2026: an earlier
+  version of this bullet claimed signed packages + verification.)
 * Emergency recovery: a boot-time / service-start safe mode loads a
   minimal allow-management-only policy so a bad rule cannot permanently
   brick remote administration. (Implementation: later milestone; the

@@ -78,6 +78,12 @@ class FeedHandler(BaseHTTPRequestHandler):
             body = b"boom"
             self.send_response(500)
             self.send_header("Content-Type", "text/plain")
+        elif mode == "deeply_nested":
+            # 200,000 nested "[" — ~400 KB, under the 1 MiB body cap,
+            # but deep enough that json.loads raises RecursionError.
+            body = (b"[" * 200_000)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
         else:  # pragma: no cover - test bug
             body = b"unknown mode"
             self.send_response(500)
@@ -175,6 +181,21 @@ def test_invalid_shape_preserves_indicators(feed_server, monkeypatch):
     assert r.status_code == 200
     assert r.json()["outcome"] == "invalid_feed"
     assert client.get("/feeds/status", headers=AUTH).json()["indicator_count"] == 2
+
+
+def test_deeply_nested_feed_is_invalid_feed_not_500(feed_server, monkeypatch):
+    # Review Nov 14, 2026: a deeply nested feed body used to raise
+    # RecursionError inside refresh_feed and 500 the endpoint with
+    # no outcome recorded. It must be invalid_feed (HTTP 200) and
+    # the stored indicators must be preserved.
+    _ingest_valid(feed_server, monkeypatch)
+    feed_server.mode = "deeply_nested"
+    r = client.post("/feeds/refresh", headers=AUTH)
+    assert r.status_code == 200, r.text
+    assert r.json()["outcome"] == "invalid_feed"
+    status = client.get("/feeds/status", headers=AUTH).json()
+    assert status["indicator_count"] == 2
+    assert status["last_outcome"] == "invalid_feed"
 
 
 def test_refresh_without_url_configured(monkeypatch):

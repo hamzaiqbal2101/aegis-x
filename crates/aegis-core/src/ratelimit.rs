@@ -55,6 +55,12 @@ impl TokenBucket {
         }
     }
 
+    /// Last time this bucket was refilled (used by `RateLimiter`
+    /// to evict idle buckets).
+    pub fn last_ts(&self) -> f64 {
+        self.last_ts
+    }
+
     /// Tokens currently available (after refill to `now`, no spend).
     pub fn available(&mut self, now: f64) -> f64 {
         if now > self.last_ts {
@@ -76,6 +82,12 @@ pub struct RateLimiter {
 
 impl RateLimiter {
     pub fn new(capacity: f64, refill_per_sec: f64) -> RateLimiter {
+        // Fail fast here, not on the first allow() call: the old
+        // code stored the parameters unchecked and panicked inside
+        // TokenBucket::new the first time a source was seen.
+        // (Review Nov 14, 2026.)
+        assert!(capacity > 0.0, "capacity must be positive");
+        assert!(refill_per_sec >= 0.0, "refill rate must be non-negative");
         RateLimiter {
             buckets: HashMap::new(),
             capacity,
@@ -91,6 +103,16 @@ impl RateLimiter {
             .entry(src)
             .or_insert_with(|| TokenBucket::new(self.capacity, self.refill_per_sec));
         bucket.allow(now)
+    }
+
+    /// Drop buckets idle for more than `idle_secs` seconds as of
+    /// `now`. Without this, `buckets` grows one entry per distinct
+    /// source IP forever — an attacker-controlled key space in any
+    /// long-running service that wires this limiter in. Callers
+    /// must call this periodically (e.g. once a minute).
+    /// (Review Nov 14, 2026.)
+    pub fn prune_idle(&mut self, now: f64, idle_secs: f64) {
+        self.buckets.retain(|_, b| now - b.last_ts() < idle_secs);
     }
 
     pub fn source_count(&self) -> usize {
@@ -136,5 +158,34 @@ mod tests {
         let mut b = TokenBucket::new(1.0, 0.0);
         assert!(b.allow(0.0));
         assert!(!b.allow(1000.0));
+    }
+
+    #[test]
+    fn review_limiter_rejects_bad_params_at_construction() {
+        // Previously these panicked on the FIRST allow() call, not
+        // at construction — fail late, in production, on first use.
+        let bad = std::panic::catch_unwind(|| RateLimiter::new(0.0, 1.0));
+        assert!(bad.is_err());
+        let bad = std::panic::catch_unwind(|| RateLimiter::new(5.0, -1.0));
+        assert!(bad.is_err());
+        let bad = std::panic::catch_unwind(|| RateLimiter::new(f64::NAN, 1.0));
+        assert!(bad.is_err());
+    }
+
+    #[test]
+    fn review_prune_idle_bounds_bucket_growth() {
+        let mut lim = RateLimiter::new(2.0, 0.0);
+        let a: IpAddr = "10.0.0.1".parse().unwrap();
+        let b: IpAddr = "10.0.0.2".parse().unwrap();
+        assert!(lim.allow(a, 0.0));
+        assert!(lim.allow(b, 100.0));
+        assert_eq!(lim.source_count(), 2);
+        // At t=200 with a 60s idle window, both buckets are idle
+        // for longer than 60s (A: 200s, B: 100s) and are gone.
+        lim.prune_idle(200.0, 60.0);
+        assert_eq!(lim.source_count(), 0);
+        // A fresh source still works after pruning.
+        assert!(lim.allow(a, 200.0));
+        assert_eq!(lim.source_count(), 1);
     }
 }

@@ -34,9 +34,17 @@
     Path to the aegis-x repository root. Defaults to the parent of
     the parent of this script
     (packaging/windows -> aegis-x).
+
+.PARAMETER Version
+    MSI version, e.g. "0.1.0". Defaults to "0.1.0" for local runs.
+    The release workflow passes the version derived from the
+    release tag (v0.2.0 -> 0.2.0); the .wxs takes it as
+    $(var.Version). Hardcoding the version in the .wxs broke
+    MajorUpgrade for later releases. (Review Nov 14, 2026.)
 #>
 param(
-    [string]$RepoRoot = (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent)
+    [string]$RepoRoot = (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent),
+    [string]$Version = "0.1.0"
 )
 
 $ErrorActionPreference = 'Stop'
@@ -82,12 +90,13 @@ foreach ($bin in @('aegis-win.exe', 'aegis-service.exe')) {
 
 # --- 3. WiX build ---------------------------------------------------------------
 Write-Host ''
-Write-Host '== Building MSI (WiX v4/v5, x64) =='
+Write-Host "== Building MSI (WiX v4/v5, x64, version $Version) =="
 # Bind paths are absolute so resolution does not depend on the
 # caller's working directory.
 wix build $WxsFile -arch x64 `
     -d BinaryDir=$BinaryDir `
     -d RepoRoot=$RepoRoot `
+    -d Version=$Version `
     -o $MsiFile
 if ($LASTEXITCODE -ne 0) { throw 'wix build failed — fix the .wxs source (see its header notes).' }
 if (-not (Test-Path $MsiFile)) { throw 'wix build reported success but no MSI was produced.' }

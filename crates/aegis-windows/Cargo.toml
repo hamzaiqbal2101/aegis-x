@@ -7,6 +7,8 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 aegis-core = { path = "../aegis-core" }
+# Used by translate.rs (filter key derivation) on every platform.
+sha2 = "0.10"
 
 # Only used by the Windows engine implementation (cfg(windows)).
 # On Linux this crate builds with a stub engine, no Windows deps.
@@ -15,7 +17,6 @@ aegis-core = { path = "../aegis-core" }
 # on it in the windows crate. Without it the engine does not compile.
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = ["Win32_Foundation", "Win32_NetworkManagement_WindowsFilteringPlatform", "Win32_Security", "Win32_System_Rpc", "Win32_System_Services", "Win32_System_Threading"] }
-sha2 = "0.10"
 
 [[bin]]
 name = "aegis-win"

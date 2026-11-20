@@ -25,17 +25,34 @@
 //!                                      two successful applies in the state dir.
 //!   eval     --policy FILE --src IP --dst IP [--sport N] [--dport N]
 //!            [--proto tcp|udp|icmp|icmpv6|any] [--state new|established|related|invalid]
-//!                                      Evaluate one packet against the
+//!            [--iif NAME] [--oif NAME]       Evaluate one packet against the
 //!                                      policy model (no OS interaction).
+//!                                      NOTE: eval models the USER rules and
+//!                                      the default action only. It does NOT
+//!                                      model the base rules (established/
+//!                                      related accept, loopback accept, ct
+//!                                      invalid drop) or rate limits: an
+//!                                      established packet denied by a rule
+//!                                      evaluates as "deny" but is accepted
+//!                                      by enforcement, and a rate-limited
+//!                                      rule evaluates as if unthrottled.
+//!                                      Treat eval as a rule-match check,
+//!                                      not a full enforcement prediction.
 //!
 //! State (last known-good script + hash) lives in `--state-dir`
 //! (default `/var/lib/aegis-x`). Rollback restores exactly that script.
+//! Applies are atomic: the delete of the old table and the create of
+//! the new one happen in a single `nft -f` transaction (see
+//! `apply_script`), so a failed apply never leaves the namespace/host
+//! without an aegis table.
 
 mod render;
 
 use aegis_core::matcher::EvalPacket;
 use aegis_core::policy::{ConnState, Protocol};
-use aegis_core::{detect_conflicts, evaluate, policy_hash, ConflictKind, Policy};
+use aegis_core::{
+    detect_conflicts, evaluate, policy_hash, sha256_hex, ConflictKind, Policy,
+};
 use std::fs;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -58,6 +75,8 @@ struct Args {
     dport: Option<u16>,
     proto: Protocol,
     state: ConnState,
+    iif: Option<String>,
+    oif: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -79,6 +98,8 @@ fn parse_args() -> Result<Args, String> {
         dport: None,
         proto: Protocol::Any,
         state: ConnState::New,
+        iif: None,
+        oif: None,
     };
     let mut i = 1;
     while i < argv.len() {
@@ -143,6 +164,8 @@ fn parse_args() -> Result<Args, String> {
                     other => return Err(format!("invalid --state {other}")),
                 }
             }
+            "--iif" => a.iif = Some(take(&mut i)?),
+            "--oif" => a.oif = Some(take(&mut i)?),
             other => return Err(format!("unknown argument: {other}")),
         }
         i += 1;
@@ -236,15 +259,108 @@ fn write_temp(script: &str) -> Result<PathBuf, String> {
     Err("cannot allocate temp file: all candidate names taken".into())
 }
 
+/// Resolve a system binary to an absolute path, preferring the
+/// standard locations over PATH lookup (a hostile or accidental
+/// PATH entry must not redirect the firewall's own tooling).
+/// Falls back to the bare name (PATH lookup) only when none of the
+/// known locations exists. (Review Nov 14, 2026: previously bare
+/// "nft"/"ip" were PATH-resolved.)
+fn resolve_bin(name: &str, candidates: &[&str]) -> String {
+    for c in candidates {
+        if Path::new(c).exists() {
+            return c.to_string();
+        }
+    }
+    name.to_string()
+}
+
+fn nft_bin() -> String {
+    resolve_bin("nft", &["/usr/sbin/nft", "/sbin/nft", "/usr/bin/nft"])
+}
+
+fn ip_bin() -> String {
+    resolve_bin("ip", &["/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip"])
+}
+
+/// True if the `inet aegis` table currently exists in the target
+/// scope. Used to pick the atomic replace variant (delete+create in
+/// one transaction, which only works when the table exists) versus
+/// create-only for a first apply.
+fn table_exists(netns: &Option<String>) -> bool {
+    let mut cmd = match netns {
+        Some(ns) => {
+            let mut c = Command::new(ip_bin());
+            c.arg("netns").arg("exec").arg(ns).arg(nft_bin());
+            c
+        }
+        None => Command::new(nft_bin()),
+    };
+    cmd.arg("list")
+        .arg("table")
+        .arg("inet")
+        .arg("aegis")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// --check then apply one script file; the temp file is removed in
+/// all paths.
+fn check_and_apply(script: &str, netns: &Option<String>) -> Result<(), String> {
+    let tmp = write_temp(script)?;
+    let checked = run_nft_check(&tmp, netns);
+    if let Err(e) = checked {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    let applied = run_nft(&tmp, netns);
+    let _ = fs::remove_file(&tmp);
+    applied.map(|_| ())
+}
+
+/// Apply a rendered script, choosing the variant that matches the
+/// live state. The delete+create file only works when the table
+/// exists; create-only only works when it does not (it MERGES into
+/// an existing table, leaving stale rules). Probe first, then
+/// --check the exact variant that will be applied, then apply it
+/// once. If the apply fails, re-probe and retry once with the other
+/// variant (covers a table deleted or created between probe and
+/// apply). A failed apply leaves the previous ruleset untouched:
+/// nft applies a whole -f file as one transaction.
+/// (Review Nov 14, 2026: replaced the old delete-then-apply
+/// two-step, which left a fail-open window with no aegis table
+/// when the apply failed after the delete.)
+fn apply_script(create_only: &str, replace: &str, netns: &Option<String>) -> Result<(), String> {
+    let use_replace = table_exists(netns);
+    let (first, second) = if use_replace {
+        (replace, create_only)
+    } else {
+        (create_only, replace)
+    };
+    match check_and_apply(first, netns) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // The live state may have changed between probe and
+            // apply (or the variant choice was wrong): re-probe and
+            // try the other variant once.
+            if table_exists(netns) == use_replace {
+                return Err(e);
+            }
+            check_and_apply(second, netns)
+                .map_err(|e2| format!("apply failed with both variants ({e}; retry: {e2})"))
+        }
+    }
+}
+
 /// Run nft (optionally inside a netns). Returns stdout on success.
 fn run_nft(script_path: &Path, netns: &Option<String>) -> Result<String, String> {
     let mut cmd = match netns {
         Some(ns) => {
-            let mut c = Command::new("ip");
-            c.arg("netns").arg("exec").arg(ns).arg("nft");
+            let mut c = Command::new(ip_bin());
+            c.arg("netns").arg("exec").arg(ns).arg(nft_bin());
             c
         }
-        None => Command::new("nft"),
+        None => Command::new(nft_bin()),
     };
     let out = cmd
         .arg("-f")
@@ -267,11 +383,11 @@ fn run_nft(script_path: &Path, netns: &Option<String>) -> Result<String, String>
 fn run_nft_check(script_path: &Path, netns: &Option<String>) -> Result<(), String> {
     let mut cmd = match netns {
         Some(ns) => {
-            let mut c = Command::new("ip");
-            c.arg("netns").arg("exec").arg(ns).arg("nft");
+            let mut c = Command::new(ip_bin());
+            c.arg("netns").arg("exec").arg(ns).arg(nft_bin());
             c
         }
-        None => Command::new("nft"),
+        None => Command::new(nft_bin()),
     };
     let out = cmd
         .arg("--check")
@@ -343,62 +459,93 @@ fn require_scope(a: &Args) -> Result<(), String> {
     Ok(())
 }
 
-/// Delete our own table, scoped to `aegis` only. `nft -f` with a table
-/// definition MERGES into an existing table instead of replacing it, so
-/// applying a policy without deleting first would leave stale rules from
-/// the previous policy in place — a real security hole (revoked allows
-/// would silently survive). Deleting first makes every apply a clean
-/// replace. "No such file" (table absent) is fine; any other failure is
-/// fatal, because proceeding would risk a merged ruleset.
-fn delete_table(netns: &Option<String>) -> Result<(), String> {
-    let mut cmd = match netns {
-        Some(ns) => {
-            let mut c = Command::new("ip");
-            c.arg("netns").arg("exec").arg(ns).arg("nft");
-            c
-        }
-        None => Command::new("nft"),
-    };
-    let out = cmd
-        .arg("delete")
-        .arg("table")
-        .arg("inet")
-        .arg("aegis")
-        .output()
-        .map_err(|e| format!("failed to run nft delete: {e}"))?;
-    if out.status.success() {
-        return Ok(());
-    }
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    if stderr.contains("No such file") {
-        Ok(())
-    } else {
-        Err(format!("nft delete table failed: {}", stderr.trim()))
-    }
-}
-
-/// State layout: `current.nft` (last successfully applied policy) and
-/// `previous.nft` (the one before it). A successful apply rotates
-/// current -> previous, then writes the new current. Rollback applies
-/// previous and swaps the two files, so rollback is itself reversible.
-fn save_current(a: &Args, script: &str, hash: &str) -> Result<(), String> {
+/// Ensure the state dir exists, owned by root, mode 0700: it holds
+/// the live firewall's source of truth (the scripts rollback will
+/// apply), so no other user may read or write it.
+fn ensure_state_dir(a: &Args) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
     fs::create_dir_all(&a.state_dir)
         .map_err(|e| format!("cannot create state dir: {e}"))?;
-    let current = a.state_dir.join("current.nft");
-    let previous = a.state_dir.join("previous.nft");
-    if current.exists() {
-        fs::copy(&current, &previous)
-            .map_err(|e| format!("cannot rotate previous policy: {e}"))?;
-        let current_hash = a.state_dir.join("current.hash");
-        let previous_hash = a.state_dir.join("previous.hash");
-        if current_hash.exists() {
-            fs::copy(&current_hash, &previous_hash)
-                .map_err(|e| format!("cannot rotate previous hash: {e}"))?;
+    fs::set_permissions(&a.state_dir, fs::Permissions::from_mode(0o700))
+        .map_err(|e| format!("cannot restrict state dir: {e}"))?;
+    Ok(())
+}
+
+/// Write `contents` to `dir/name` atomically: create a temp file in
+/// the same directory (O_EXCL, mode 0600), write, then rename over
+/// the destination. Never follows a pre-existing symlink at the
+/// destination (rename replaces the link itself), and a crash
+/// mid-write cannot leave a half-written script.
+/// (Review Nov 14, 2026: previously `fs::write` followed symlinks
+/// and wrote in place.)
+fn write_state_file(dir: &Path, name: &str, contents: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let dest = dir.join(name);
+    for suffix in 0..100 {
+        let tmp = if suffix == 0 {
+            dir.join(format!(".{name}.tmp-{}", std::process::id()))
+        } else {
+            dir.join(format!(".{name}.tmp-{}-{suffix}", std::process::id()))
+        };
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+        {
+            Ok(mut f) => {
+                f.write_all(contents)
+                    .map_err(|e| format!("cannot write state file {name}: {e}"))?;
+                drop(f);
+                fs::rename(&tmp, &dest)
+                    .map_err(|e| format!("cannot install state file {name}: {e}"))?;
+                return Ok(());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("cannot write state file {name}: {e}")),
         }
     }
-    fs::write(&current, script).map_err(|e| format!("cannot save current script: {e}"))?;
-    fs::write(a.state_dir.join("current.hash"), hash)
-        .map_err(|e| format!("cannot save current hash: {e}"))?;
+    Err(format!("cannot allocate state temp file for {name}"))
+}
+
+/// State layout: `current.nft` (last successfully applied policy)
+/// and `previous.nft` (the one before it), plus `current.hash` /
+/// `previous.hash` (policy hashes) and `current.script_hash` /
+/// `previous.script_hash` (SHA-256 of the script itself — rollback
+/// verifies it before applying, so a tampered state file cannot
+/// smuggle arbitrary nft script into the firewall). A successful
+/// apply rotates current -> previous, then writes the new current.
+/// Rollback applies previous and swaps the two files, so rollback
+/// is itself reversible. Rotation is by rename (never copy: a copy
+/// follows symlinks).
+fn save_current(a: &Args, script: &str, hash: &str) -> Result<(), String> {
+    ensure_state_dir(a)?;
+    let current = a.state_dir.join("current.nft");
+    if current.exists() {
+        fs::rename(&current, a.state_dir.join("previous.nft"))
+            .map_err(|e| format!("cannot rotate previous policy: {e}"))?;
+        let current_hash = a.state_dir.join("current.hash");
+        if current_hash.exists() {
+            fs::rename(&current_hash, a.state_dir.join("previous.hash"))
+                .map_err(|e| format!("cannot rotate previous hash: {e}"))?;
+        }
+        let current_script_hash = a.state_dir.join("current.script_hash");
+        if current_script_hash.exists() {
+            fs::rename(
+                &current_script_hash,
+                a.state_dir.join("previous.script_hash"),
+            )
+            .map_err(|e| format!("cannot rotate previous script hash: {e}"))?;
+        }
+    }
+    write_state_file(&a.state_dir, "current.nft", script.as_bytes())?;
+    write_state_file(&a.state_dir, "current.hash", hash.as_bytes())?;
+    write_state_file(
+        &a.state_dir,
+        "current.script_hash",
+        sha256_hex(script.as_bytes()).as_bytes(),
+    )?;
     Ok(())
 }
 
@@ -486,27 +633,18 @@ fn cmd_apply(a: &Args) -> Result<(), String> {
     gate_app_rules(&policy)?;
     gate_conflicts(&policy)?;
     let conntrack = resolve_conntrack(a, &policy)?;
-    let script = render::render_opts(
-        &policy,
-        render::RenderOptions {
-            conntrack,
-            loopback_accept: !a.no_loopback_accept,
-        },
-    );
-    let tmp = write_temp(&script)?;
-    // Validate syntax before applying.
-    let checked = run_nft_check(&tmp, &a.netns);
-    if checked.is_err() {
-        let _ = fs::remove_file(&tmp);
-        checked?;
-    }
-    // Replace, never merge: delete our table first (see delete_table).
-    delete_table(&a.netns)?;
-    let applied = run_nft(&tmp, &a.netns);
-    let _ = fs::remove_file(&tmp);
-    applied?;
+    let opts = render::RenderOptions {
+        conntrack,
+        loopback_accept: !a.no_loopback_accept,
+    };
+    // Atomic replace: the delete of the old table and the create of
+    // the new one happen in one nft transaction (see apply_script),
+    // so a failed apply leaves the previous ruleset in place.
+    let create_only = render::render_opts(&policy, opts);
+    let replace = render::render_replace(&policy, opts);
+    apply_script(&create_only, &replace, &a.netns)?;
     let hash = policy_hash(&policy);
-    save_current(a, &script, &hash)?;
+    save_current(a, &create_only, &hash)?;
     match &a.netns {
         Some(ns) => println!("OK: policy \"{}\" applied in netns {ns}", policy.name),
         None => println!(
@@ -538,6 +676,28 @@ fn cmd_rollback(a: &Args) -> Result<(), String> {
             a.state_dir.display()
         )
     })?;
+    // Verify the stored script before applying it: the state dir is
+    // the firewall's source of truth, and until now nothing checked
+    // that the script in it was the one apply wrote. A tampered
+    // previous.nft could have contained arbitrary nft script
+    // (including flushing other tables). The hash file must exist
+    // and match; state dirs created by older versions have no
+    // script hash — re-apply twice to re-establish verified state.
+    // (Review Nov 14, 2026.)
+    let expected_hash = fs::read_to_string(a.state_dir.join("previous.script_hash"))
+        .map_err(|_| {
+            "previous.script_hash is missing — refusing to apply an \
+             unauthenticated stored script (state dir from an older \
+             version: apply twice to re-establish verified state)"
+                .to_string()
+        })?;
+    if expected_hash.trim() != sha256_hex(script.as_bytes()) {
+        return Err(
+            "previous script hash mismatch — the stored rollback script \
+             has been modified; refusing to apply it"
+                .into(),
+        );
+    }
     // The swap below must have a real current policy to move into
     // "previous": previously a missing current.nft was replaced with
     // an empty byte string, poisoning "previous" so the next rollback
@@ -550,28 +710,24 @@ fn cmd_rollback(a: &Args) -> Result<(), String> {
             a.state_dir.display()
         ));
     }
-    let tmp = write_temp(&script)?;
-    let checked = run_nft_check(&tmp, &a.netns);
-    if checked.is_err() {
-        let _ = fs::remove_file(&tmp);
-        checked?;
-    }
-    delete_table(&a.netns)?;
-    let applied = run_nft(&tmp, &a.netns);
-    let _ = fs::remove_file(&tmp);
-    applied?;
-    // Swap so rollback is reversible: the policy we just replaced
-    // becomes the new "previous".
-    let current_hash = a.state_dir.join("current.hash");
-    let previous_hash = a.state_dir.join("previous.hash");
+    // Read all swap values before writing any of them.
     let old_current = fs::read(&current).map_err(|e| format!("cannot read current: {e}"))?;
-    let old_current_hash = fs::read(&current_hash).unwrap_or_default();
-    fs::write(&current, &script).map_err(|e| format!("cannot swap current: {e}"))?;
-    fs::write(&current_hash, fs::read(&previous_hash).unwrap_or_default())
-        .map_err(|e| format!("cannot swap current hash: {e}"))?;
-    fs::write(&previous, old_current).map_err(|e| format!("cannot swap previous: {e}"))?;
-    fs::write(&previous_hash, old_current_hash)
-        .map_err(|e| format!("cannot swap previous hash: {e}"))?;
+    let old_current_hash = fs::read(a.state_dir.join("current.hash")).unwrap_or_default();
+    let old_current_script_hash =
+        fs::read(a.state_dir.join("current.script_hash")).unwrap_or_default();
+    let prev_hash = fs::read(a.state_dir.join("previous.hash")).unwrap_or_default();
+    let prev_script_hash = fs::read(a.state_dir.join("previous.script_hash")).unwrap_or_default();
+    // Apply the stored (create-only) script atomically.
+    let replace = format!("delete table inet aegis\n{script}");
+    apply_script(&script, &replace, &a.netns)?;
+    // Swap so rollback is reversible: the policy we just replaced
+    // becomes the new "previous". Atomic writes (temp + rename).
+    write_state_file(&a.state_dir, "current.nft", script.as_bytes())?;
+    write_state_file(&a.state_dir, "current.hash", &prev_hash)?;
+    write_state_file(&a.state_dir, "current.script_hash", &prev_script_hash)?;
+    write_state_file(&a.state_dir, "previous.nft", &old_current)?;
+    write_state_file(&a.state_dir, "previous.hash", &old_current_hash)?;
+    write_state_file(&a.state_dir, "previous.script_hash", &old_current_script_hash)?;
     println!("OK: rolled back to previous policy (rollback again to undo)");
     Ok(())
 }
@@ -587,8 +743,8 @@ fn cmd_eval(a: &Args) -> Result<(), String> {
         dst_port: a.dport,
         protocol: a.proto,
         state: a.state,
-        in_interface: None,
-        out_interface: None,
+        in_interface: a.iif.clone(),
+        out_interface: a.oif.clone(),
     };
     let verdict = evaluate(&policy, &pkt);
     println!("action: {:?}", verdict.action);
@@ -661,5 +817,74 @@ mod tests {
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(&victim);
         let _ = fs::remove_file(&link);
+    }
+
+    // --- Review Nov 14, 2026: atomic state writes ---
+
+    #[test]
+    fn review_write_state_file_never_follows_a_symlink() {
+        // Pre-create the destination as a symlink to a victim file.
+        // write_state_file must replace the LINK, not write through
+        // it into the victim.
+        let dir = std::env::temp_dir().join(format!("aegis-state-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim.txt");
+        fs::write(&victim, "do not overwrite").unwrap();
+        let link = dir.join("current.nft");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        write_state_file(&dir, "current.nft", b"new script").unwrap();
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "do not overwrite");
+        // The destination is now a real file with the new content
+        // (the symlink was replaced by rename).
+        assert_eq!(fs::read_to_string(&link).unwrap(), "new script");
+        assert!(!fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn review_save_current_writes_script_hash() {
+        let dir = std::env::temp_dir().join(format!("aegis-save-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let args = Args {
+            cmd: "apply".to_string(),
+            policy: None,
+            netns: None,
+            confirm_host: false,
+            no_conntrack: false,
+            no_loopback_accept: false,
+            state_dir: dir.clone(),
+            src: None,
+            dst: None,
+            sport: None,
+            dport: None,
+            proto: Protocol::Any,
+            state: ConnState::New,
+            iif: None,
+            oif: None,
+        };
+        let script = "table inet aegis {\n  chain input {\n    type filter hook input priority filter; policy drop;\n  }\n}\n";
+        save_current(&args, script, "deadbeef").unwrap();
+        assert_eq!(fs::read_to_string(dir.join("current.nft")).unwrap(), script);
+        assert_eq!(fs::read_to_string(dir.join("current.hash")).unwrap(), "deadbeef");
+        assert_eq!(
+            fs::read_to_string(dir.join("current.script_hash")).unwrap(),
+            sha256_hex(script.as_bytes())
+        );
+        // State dir is locked down.
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+        // A second save rotates current -> previous, including the
+        // script hash.
+        let script2 = "table inet aegis {\n  chain input {\n    type filter hook input priority filter; policy drop;\n    tcp dport 80 counter accept\n  }\n}\n";
+        save_current(&args, script2, "cafe").unwrap();
+        assert_eq!(fs::read_to_string(dir.join("previous.nft")).unwrap(), script);
+        assert_eq!(
+            fs::read_to_string(dir.join("previous.script_hash")).unwrap(),
+            sha256_hex(script.as_bytes())
+        );
+        assert_eq!(fs::read_to_string(dir.join("current.nft")).unwrap(), script2);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

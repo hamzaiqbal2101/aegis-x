@@ -332,8 +332,13 @@ pub struct Zone {
 }
 
 /// A complete, loadable policy document.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+///
+/// `Deserialize` is implemented by hand (see below): every
+/// deserialization path — not just `from_json` — runs `normalize`,
+/// so a policy can never exist in unnormalized form in memory.
+/// An unnormalized rule is the fail-open footgun: an unexpanded
+/// zone reference leaves `src_addrs` empty, which means "any".
+#[derive(Debug, Clone, Serialize)]
 pub struct Policy {
     pub version: u32,
     pub name: String,
@@ -343,6 +348,42 @@ pub struct Policy {
     #[serde(default)]
     pub zones: Vec<Zone>,
     pub rules: Vec<Rule>,
+}
+
+/// Shadow struct for deserialization: same fields, same
+/// `deny_unknown_fields` strictness; `Policy`'s own `Deserialize`
+/// parses into this and then normalizes.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolicyDef {
+    version: u32,
+    name: String,
+    #[serde(default = "default_mode")]
+    mode: String,
+    default_action: Action,
+    #[serde(default)]
+    zones: Vec<Zone>,
+    rules: Vec<Rule>,
+}
+
+impl<'de> Deserialize<'de> for Policy {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Policy, D::Error> {
+        let def = PolicyDef::deserialize(deserializer)?;
+        let mut policy = Policy {
+            version: def.version,
+            name: def.name,
+            mode: def.mode,
+            default_action: def.default_action,
+            zones: def.zones,
+            rules: def.rules,
+        };
+        // Normalizing here (in addition to `from_json`'s explicit
+        // call, which is now redundant but harmless — normalize is
+        // idempotent) means no caller can hold an unnormalized
+        // policy by deserializing it directly. (Review Nov 14, 2026.)
+        policy.normalize().map_err(serde::de::Error::custom)?;
+        Ok(policy)
+    }
 }
 
 fn default_mode() -> String {
@@ -390,6 +431,24 @@ impl Policy {
     fn normalize(&mut self) -> Result<(), String> {
         Self::check_script_safe("policy name", &self.name)?;
         Self::check_script_safe("policy mode", &self.mode)?;
+        // Only version 1 exists. A future v2 document silently read
+        // as v1 would be misinterpreted (new fields ignored or
+        // semantics changed), so unknown versions are a load error.
+        // (Review Nov 14, 2026: previously any u32 loaded.)
+        if self.version != 1 {
+            return Err(format!("unsupported policy version: {}", self.version));
+        }
+        // `mode` is not enforced anywhere: the only implemented
+        // profile is "standard". A policy that says "monitor"
+        // (documented as observe-only) would still enforce its
+        // rules, so non-standard modes are a load error until mode
+        // profiles are actually implemented. (Review Nov 14, 2026.)
+        if self.mode != "standard" {
+            return Err(format!(
+                "unsupported policy mode: {:?} (only \"standard\" is implemented)",
+                self.mode
+            ));
+        }
         // Duplicate zone names are a load error: previously the last
         // definition silently won for rule expansion (HashMap collect)
         // while zone_matrix used the first (Vec::find), so the
@@ -413,6 +472,14 @@ impl Policy {
             if !seen_ids.insert(rule.id.clone()) {
                 return Err(format!("duplicate rule id: {}", rule.id));
             }
+            // "aegis-default-deny" is the id of the Windows
+            // default-deny filters; a user rule with that id gets the
+            // same WFP filter key on every layer and install fails
+            // with FWP_E_ALREADY_EXISTS. Reserved at load (both
+            // platforms). (Review Nov 14, 2026.)
+            if rule.id == "aegis-default-deny" {
+                return Err("rule id \"aegis-default-deny\" is reserved".to_string());
+            }
             Self::check_script_safe("rule id", &rule.id)?;
             if let Some(iif) = &rule.in_interface {
                 Self::check_script_safe("in_interface", iif)?;
@@ -432,6 +499,37 @@ impl Policy {
                         return Err(format!("rule {}: inverted port range", rule.id));
                     }
                 }
+            }
+            if let Some(limit) = &rule.rate_limit {
+                // A rate of 0 or burst of 0 is not a limit at all:
+                // nft's parser rejects burst 0 ("packet limit burst
+                // must be > 0") and a rate of 0 on a deny rule means
+                // the drop never fires (fail-open if a later allow
+                // matches). Reject at load with a clear error instead
+                // of a cryptic apply-time failure. (Review Nov 14, 2026.)
+                if limit.rate == 0 {
+                    return Err(format!("rule {}: rate_limit.rate must be >= 1", rule.id));
+                }
+                if let Some(burst) = limit.burst {
+                    if burst == 0 {
+                        return Err(format!(
+                            "rule {}: rate_limit.burst must be >= 1",
+                            rule.id
+                        ));
+                    }
+                }
+            }
+            // A rule matching only the Invalid state can never fire:
+            // the base policy denies Invalid before any rule is
+            // evaluated, so the rule would sit in the policy looking
+            // like protection while doing nothing. Reject it.
+            // (Review Nov 14, 2026.)
+            if rule.states.len() == 1 && rule.states[0] == ConnState::Invalid {
+                return Err(format!(
+                    "rule {}: states [\"invalid\"] only can never match \
+                     (Invalid is denied by the base policy)",
+                    rule.id
+                ));
             }
             if let Some(zone_name) = &rule.src_zone {
                 let zone = zones
@@ -609,6 +707,82 @@ mod tests {
         let unused = r#"{"version":1,"name":"t","default_action":"deny",
             "zones":[{"name":"void","subnets":[]}],"rules":[]}"#;
         assert!(Policy::from_json(unused).is_ok());
+    }
+
+    // --- Review Nov 14, 2026: load-time validation regressions ---
+
+    #[test]
+    fn review_rejects_unknown_version() {
+        let v2 = r#"{"version":2,"name":"t","default_action":"deny","rules":[]}"#;
+        assert!(Policy::from_json(v2).is_err());
+        let v0 = r#"{"version":0,"name":"t","default_action":"deny","rules":[]}"#;
+        assert!(Policy::from_json(v0).is_err());
+        let v1 = r#"{"version":1,"name":"t","default_action":"deny","rules":[]}"#;
+        assert!(Policy::from_json(v1).is_ok());
+    }
+
+    #[test]
+    fn review_rejects_non_standard_mode() {
+        let monitor = r#"{"version":1,"name":"t","mode":"monitor",
+            "default_action":"deny","rules":[]}"#;
+        assert!(Policy::from_json(monitor).is_err());
+        let standard = r#"{"version":1,"name":"t","mode":"standard",
+            "default_action":"deny","rules":[]}"#;
+        assert!(Policy::from_json(standard).is_ok());
+        // No mode key at all defaults to "standard".
+        let omitted = r#"{"version":1,"name":"t","default_action":"deny","rules":[]}"#;
+        assert!(Policy::from_json(omitted).is_ok());
+    }
+
+    #[test]
+    fn review_rejects_reserved_default_deny_rule_id() {
+        let reserved = r#"{"version":1,"name":"t","default_action":"deny",
+            "rules":[{"id":"aegis-default-deny","priority":1,"action":"allow"}]}"#;
+        assert!(Policy::from_json(reserved).is_err());
+    }
+
+    #[test]
+    fn review_rejects_zero_rate_or_burst() {
+        let zero_rate = r#"{"version":1,"name":"t","default_action":"deny",
+            "rules":[{"id":"r","priority":1,"action":"allow",
+                      "rate_limit":{"rate":0,"unit":"second"}}]}"#;
+        assert!(Policy::from_json(zero_rate).is_err());
+        let zero_burst = r#"{"version":1,"name":"t","default_action":"deny",
+            "rules":[{"id":"r","priority":1,"action":"allow",
+                      "rate_limit":{"rate":10,"unit":"second","burst":0}}]}"#;
+        assert!(Policy::from_json(zero_burst).is_err());
+        let ok = r#"{"version":1,"name":"t","default_action":"deny",
+            "rules":[{"id":"r","priority":1,"action":"allow",
+                      "rate_limit":{"rate":10,"unit":"second","burst":5}}]}"#;
+        assert!(Policy::from_json(ok).is_ok());
+    }
+
+    #[test]
+    fn review_rejects_invalid_only_rule() {
+        let dead = r#"{"version":1,"name":"t","default_action":"deny",
+            "rules":[{"id":"r","priority":1,"action":"allow","states":["invalid"]}]}"#;
+        assert!(Policy::from_json(dead).is_err());
+        // Invalid combined with other states is meaningful (the rule
+        // still matches the non-invalid states).
+        let mixed = r#"{"version":1,"name":"t","default_action":"deny",
+            "rules":[{"id":"r","priority":1,"action":"allow","states":["new","invalid"]}]}"#;
+        assert!(Policy::from_json(mixed).is_ok());
+    }
+
+    #[test]
+    fn review_direct_deserialize_also_normalizes() {
+        // A policy deserialized directly (bypassing from_json) used
+        // to come back unnormalized: zone references unexpanded, so
+        // an unexpanded rule's empty src_addrs meant "any".
+        let json = r#"{"version":1,"name":"t","default_action":"deny",
+            "zones":[{"name":"lan","subnets":["192.168.0.0/16"]}],
+            "rules":[{"id":"r","priority":1,"action":"allow","src_zone":"lan"}]}"#;
+        let p: Policy = serde_json::from_str(json).unwrap();
+        assert_eq!(p.rules[0].src_addrs.len(), 1);
+        // And an invalid document is rejected by direct
+        // deserialization too, not just by from_json.
+        let bad = r#"{"version":2,"name":"t","default_action":"deny","rules":[]}"#;
+        assert!(serde_json::from_str::<Policy>(bad).is_err());
     }
 
     #[test]

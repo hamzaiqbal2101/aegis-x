@@ -73,7 +73,18 @@ impl Indicator {
             return false;
         }
         match kind {
-            IndicatorKind::Ip => self.value == value,
+            IndicatorKind::Ip => {
+                // Compare parsed addresses, not raw strings: a query
+                // spelling like "203.0.113.05" must not slip past a
+                // block on "203.0.113.5". The indicator value was
+                // validated at load (it parses); the query is parsed
+                // here. An unparseable query never matches.
+                // (Review Nov 14, 2026.)
+                match (IpAddr::from_str(&self.value), IpAddr::from_str(value)) {
+                    (Ok(a), Ok(b)) => a == b,
+                    _ => false,
+                }
+            }
             IndicatorKind::Domain => entry_matches(&self.value, value),
         }
     }
@@ -117,8 +128,17 @@ impl Feed {
     pub fn is_blocked(&self, kind: IndicatorKind, value: &str, now: u64) -> bool {
         match kind {
             IndicatorKind::Ip => {
-                if self.allowlist.iter().any(|a| a == value) {
-                    return false;
+                // Canonical comparison for the allowlist too: an
+                // allowlist entry must match the queried address
+                // regardless of spelling. (Review Nov 14, 2026.)
+                if let Ok(query) = IpAddr::from_str(value) {
+                    if self.allowlist.iter().any(|a| {
+                        IpAddr::from_str(a)
+                            .map(|allowed| allowed == query)
+                            .unwrap_or(false)
+                    }) {
+                        return false;
+                    }
                 }
             }
             IndicatorKind::Domain => {
@@ -198,5 +218,24 @@ mod tests {
         // Empty feed loads fine (zero indicators).
         let empty = Feed::from_json(r#"{"version":1,"indicators":[]}"#).unwrap();
         assert!(!empty.is_blocked(IndicatorKind::Ip, "203.0.113.5", 0));
+    }
+
+    #[test]
+    fn review_ip_matching_is_canonical_not_string() {
+        // A non-canonical spelling of a blocked IP must still match.
+        // Feed values are always canonical (validated at load), so
+        // the IPv6 compressed-vs-expanded form is the case string
+        // equality would miss; an unparseable query never matches.
+        let feed = Feed::from_json(
+            r#"{"indicators":[{"kind":"ip","value":"2001:db8::1"}]}"#,
+        )
+        .unwrap();
+        assert!(feed.is_blocked(
+            IndicatorKind::Ip,
+            "2001:0db8:0000:0000:0000:0000:0000:0001",
+            1000
+        ));
+        assert!(!feed.is_blocked(IndicatorKind::Ip, "2001:db8::2", 1000));
+        assert!(!feed.is_blocked(IndicatorKind::Ip, "not-an-ip", 1000));
     }
 }

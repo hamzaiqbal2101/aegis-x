@@ -172,6 +172,52 @@ def test_pagination_bounds_and_behavior():
             client.delete(f"/policies/{pid}", headers=AUTH)
 
 
+def test_list_limit_capped_at_1000():
+    # Review Nov 14, 2026: the list endpoints allowed limit=10000,
+    # so a readonly-token holder could request 10,000 policies at up
+    # to ~1 MiB each. The cap is now 1000 (the dashboard uses the
+    # default 1000, so it is unaffected).
+    assert client.get("/policies?limit=1000", headers=AUTH).status_code == 200
+    assert client.get("/policies?limit=1001", headers=AUTH).status_code == 422
+    assert client.get("/audit?limit=1001", headers=AUTH).status_code == 422
+
+
+# --- policy scalar magnitude caps (review Nov 14, 2026) ---
+
+def test_giant_int_policy_is_400_not_500():
+    # A 101-digit int parses fine in the request but is outside the
+    # 64-bit range: it must be a 400 from validation, never a 500
+    # from json.dumps/SQLite binding later.
+    big = {"version": 1, "name": "big", "default_action": "deny",
+           "rules": [{"id": "r", "priority": 10**100, "action": "allow"}]}
+    r = client.post("/policies", json={"name": "big", "policy": big}, headers=AUTH)
+    assert r.status_code == 400, r.text
+    # A 5000-digit int (past Python's int<->str limit) is rejected by
+    # the validation walk itself, not just by the request parser.
+    from app import validate_policy_shape
+    huge = {"version": 1, "name": "huge", "default_action": "deny",
+            "rules": [{"id": "r", "priority": 10**5000, "action": "allow"}]}
+    assert validate_policy_shape(huge) is not None
+
+
+def test_huge_string_policy_is_400():
+    big = {"version": 1, "name": "x" * 70000, "default_action": "deny",
+           "rules": []}
+    r = client.post("/policies", json={"name": "big", "policy": big}, headers=AUTH)
+    assert r.status_code == 400, r.text
+
+
+def test_nan_policy_is_400():
+    # NaN parses from JSON (Python accepts it) but json.dumps emits
+    # it as bare NaN — invalid JSON — so a stored policy would
+    # corrupt its own serialization. Must be a 400.
+    body = (b'{"name": "nan", "policy": {"version": 1, "name": "n", '
+            b'"default_action": "deny", "rules": [], "pad": NaN}}')
+    r = client.post("/policies", content=body,
+                    headers={**AUTH, "Content-Type": "application/json"})
+    assert r.status_code == 400, r.text
+
+
 # --- docs / info disclosure ---
 
 def test_auto_docs_disabled_without_auth():

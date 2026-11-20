@@ -310,7 +310,10 @@ fn render_chain(
 }
 
 /// Render the full nftables script for a policy, with stateful
-/// (`ct`) base rules. This is the shipped default.
+/// (`ct`) base rules. This is the shipped default. (Kept as the
+/// public default even though the CLI currently routes through
+/// `render_opts`; the test suite and future callers use it.)
+#[allow(dead_code)]
 pub fn render(policy: &Policy) -> String {
     render_opts(policy, RenderOptions::default())
 }
@@ -334,6 +337,29 @@ pub fn render_opts(policy: &Policy, opts: RenderOptions) -> String {
     out
 }
 
+/// Render the script as an ATOMIC replace of the live table: the
+/// `delete table` and the new table definition are in one `nft -f`
+/// file, so nft applies them as a single transaction — either the
+/// whole new table lands or the old one stays untouched. The old
+/// two-step flow (delete via one `nft delete` invocation, then
+/// apply via another) left a fail-open window: if the apply failed
+/// after the delete, the namespace/host had NO aegis table at all.
+/// (Review Nov 14, 2026; verified in an isolated namespace: the
+/// atomic file replaces cleanly when the table exists, and fails
+/// with the old table intact when the new script is invalid.)
+///
+/// The delete only works when the table EXISTS: `nft -f` with a
+/// `delete table` for a missing table aborts the whole transaction.
+/// Callers must probe table existence first and use plain `render`
+/// (create-only) for a first apply.
+pub fn render_replace(policy: &Policy, opts: RenderOptions) -> String {
+    let mut out = String::new();
+    out.push_str("# AEGIS X atomic replace: delete + create in one transaction\n");
+    out.push_str("delete table inet aegis\n");
+    out.push_str(&render_opts(policy, opts));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,6 +380,24 @@ mod tests {
         assert!(script.contains("tcp dport 443 counter accept"));
         assert!(script.contains("ct state invalid counter drop"));
         assert!(script.contains("counter drop comment \"aegis: default deny\""));
+    }
+
+    #[test]
+    fn review_render_replace_is_delete_then_create_in_one_file() {
+        // The atomic replace variant must delete the old table and
+        // define the new one in the SAME file, with the delete first
+        // — that is what makes the apply a single nft transaction.
+        let p = policy(
+            r#"{"version":1,"name":"t","default_action":"deny","rules":[
+              {"id":"web","priority":10,"action":"allow","protocol":"tcp","dst_port":443}]}"#,
+        );
+        let script = render_replace(&p, RenderOptions::default());
+        let delete_pos = script.find("delete table inet aegis").expect("delete line");
+        let table_pos = script.find("table inet aegis {").expect("table definition");
+        assert!(delete_pos < table_pos);
+        assert!(script.contains("tcp dport 443 counter accept"));
+        // The create-only render must NOT contain a delete line.
+        assert!(!render(&p).contains("delete table inet aegis"));
     }
 
     #[test]

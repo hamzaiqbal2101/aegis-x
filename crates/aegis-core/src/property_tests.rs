@@ -440,9 +440,11 @@ fn adversarial_inputs_never_panic_and_reject_as_expected() {
             false,
         ),
         (
+            // Only version 1 is accepted now (review Nov 14, 2026):
+            // a future version must not be silently read as v1.
             "version u32 max",
             r#"{"version":4294967295,"name":"t","default_action":"deny","rules":[]}"#.to_string(),
-            true,
+            false,
         ),
         (
             "port u16 max",

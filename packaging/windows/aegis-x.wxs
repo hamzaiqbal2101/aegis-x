@@ -10,10 +10,9 @@
     inner text to the Condition attribute, WIX0400), the MSI built
     and its install/uninstall cycle PASSED there, and a default
     policy (allow-all, empty rules, NeverOverwrite) was added the
-    same evening to close the bare-install gap — but the MSI
-    rebuild with that policy, and its retest, are still pending
-    on the operator's PC, and that build is the real schema check
-    for the new component.
+    same evening to close the bare-install gap — the MSI rebuild
+    with that policy and its retest PASSED the same evening
+    (bare install: 4 WFP filters; install/uninstall cycle PASS).
   * The resulting MSI is UNSIGNED until the operator signs it with
     their own code-signing certificate (see build-msi.ps1). Never
     ship the unsigned MSI as a release, and never invent a
@@ -27,11 +26,19 @@
     MSI. They deliberately do NOT reuse the WFP provider/sublayer
     GUIDs (see crates/aegis-windows/src/engine.rs) — MSI component
     identity and WFP object identity are unrelated namespaces.
+  * Bare install: the MSI rebuild with the default policy and its
+    retest PASSED on the operator's PC Nov 3, 2026 (4 WFP filters
+    installed from the bare install; install/uninstall cycle PASS).
 
   Build variables (passed by build-msi.ps1, absolute paths):
     BinaryDir — directory holding release aegis-win.exe +
                aegis-service.exe (cargo build, release mode).
     RepoRoot  — repository root, for the bundled docs.
+    Version   — MSI version, from the release tag (build-msi.ps1
+               -Version; the release workflow derives it from the
+               tag, e.g. v0.2.0 -> 0.2.0). Hardcoding it here broke
+               MajorUpgrade: a v0.2.0 release would have shipped an
+               MSI still labeled 0.1.0. (Review Nov 14, 2026.)
 
   Design notes:
   * No custom UI: the MSI uses the WiX default dialogs only. No
@@ -56,7 +63,7 @@
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
   <Package Name="AEGIS X"
           Manufacturer="AEGIS X"
-          Version="0.1.0"
+          Version="$(var.Version)"
           UpgradeCode="ba124f2a-904b-4c44-9b2f-5b7af52e6f26"
           Scope="perMachine">
     <MajorUpgrade DowngradeErrorMessage="A newer version of AEGIS X is already installed." />
